@@ -7,7 +7,7 @@
     "db:migrate": "node scripts/migrate.mjs",
     "lint": "oxlint src",
     "typecheck": "tsc --noEmit -p tsconfig.json",
-    "test": "vitest run",
+    "test": "vitest run --no-file-parallelism",
     "start": "node dist/main.js"
   },
   "dependencies": {
