@@ -18,10 +18,7 @@ import type { Clock } from './clock';
 import {
   IdempotencyConflictError,
 } from './atomic-capacity.types';
-import type {
-  AcquireCommand,
-  OperationResult,
-} from './atomic-capacity.types';
+import type { AcquireCommand } from './atomic-capacity.types';
 
 class MutableClock implements Clock {
   constructor(private current: Date) {}
