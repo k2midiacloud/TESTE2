@@ -52,37 +52,7 @@ export class AtomicCapacityService {
     const payload = this.payloadFor(command);
 
     return this.database.transaction(async (client) => {
-      await client.query(
-        `
-          INSERT INTO issue3_lab.operations (
-            operation_id,
-            resource_id,
-            actor_id,
-            wallet_id,
-            amount,
-            payload,
-            state,
-            reason,
-            hold_expires_at,
-            created_at,
-            updated_at
-          )
-          VALUES ($1, $2, $3, $4, $5, $6::jsonb, 'PENDING', NULL, $7, $8, $8)
-          ON CONFLICT (operation_id) DO NOTHING
-        `,
-        [
-          command.operationId,
-          command.resourceId,
-          command.actorId,
-          command.walletId,
-          String(command.amount),
-          payload,
-          command.holdExpiresAt,
-          now,
-        ],
-      );
-
-      const snapshotResult = await client.query<OperationSnapshotRow>(
+      const initialResult = await client.query<OperationSnapshotRow>(
         `
           SELECT
             operation_id,
@@ -99,19 +69,17 @@ export class AtomicCapacityService {
         [command.operationId, payload],
       );
 
-      const snapshot = snapshotResult.rows[0];
+      const initial = initialResult.rows[0];
 
-      if (!snapshot) {
-        throw new DataInvariantError('operation disappeared after idempotent insert');
-      }
-
-      if (!snapshot.payload_matches) {
+      if (initial && !initial.payload_matches) {
         throw new IdempotencyConflictError(command.operationId);
       }
 
-      if (this.isTerminal(snapshot.state)) {
-        return this.toResult(snapshot);
+      if (initial && this.isTerminal(initial.state)) {
+        return this.toResult(initial);
       }
+
+      const resourceId = initial?.resource_id ?? command.resourceId;
 
       const resourceResult = await client.query<CapacityRow>(
         `
@@ -120,18 +88,80 @@ export class AtomicCapacityService {
           WHERE resource_id = $1
           FOR UPDATE
         `,
-        [snapshot.resource_id],
+        [resourceId],
       );
 
       const resource = resourceResult.rows[0];
 
       if (!resource) {
-        throw new DataInvariantError(
-          `resource ${snapshot.resource_id} referenced by operation does not exist`,
+        throw new DataInvariantError(`resource ${resourceId} does not exist`);
+      }
+
+      if (!initial) {
+        await client.query(
+          `
+            INSERT INTO issue3_lab.operations (
+              operation_id,
+              resource_id,
+              actor_id,
+              wallet_id,
+              amount,
+              payload,
+              state,
+              reason,
+              hold_expires_at,
+              created_at,
+              updated_at
+            )
+            VALUES ($1, $2, $3, $4, $5, $6::jsonb, 'PENDING', NULL, $7, $8, $8)
+            ON CONFLICT (operation_id) DO NOTHING
+          `,
+          [
+            command.operationId,
+            command.resourceId,
+            command.actorId,
+            command.walletId,
+            String(command.amount),
+            payload,
+            command.holdExpiresAt,
+            now,
+          ],
         );
       }
 
-      await this.expireResourceHolds(client, snapshot.resource_id, now);
+      const lockedResult = await client.query<OperationSnapshotRow>(
+        `
+          SELECT
+            operation_id,
+            resource_id,
+            wallet_id,
+            amount,
+            state,
+            reason,
+            hold_expires_at,
+            payload = $2::jsonb AS payload_matches
+          FROM issue3_lab.operations
+          WHERE operation_id = $1
+          FOR UPDATE
+        `,
+        [command.operationId, payload],
+      );
+
+      const locked = lockedResult.rows[0];
+
+      if (!locked) {
+        throw new DataInvariantError('operation disappeared after idempotent insert');
+      }
+
+      if (!locked.payload_matches) {
+        throw new IdempotencyConflictError(command.operationId);
+      }
+
+      if (this.isTerminal(locked.state)) {
+        return this.toResult(locked);
+      }
+
+      await this.expireResourceHolds(client, locked.resource_id, now);
 
       const current = await this.lockOperation(client, command.operationId);
 
