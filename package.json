@@ -1,0 +1,12 @@
+{
+  "name": "teste2-lab",
+  "version": "0.0.0",
+  "private": true,
+  "workspaces": ["apps/*"],
+  "scripts": {
+    "build": "npm run build --workspace @teste2/api",
+    "lint": "npm run lint --workspace @teste2/api",
+    "typecheck": "npm run typecheck --workspace @teste2/api",
+    "test": "npm run test --workspace @teste2/api"
+  }
+}
