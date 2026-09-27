@@ -4,21 +4,24 @@
   "private": true,
   "scripts": {
     "build": "tsc -p tsconfig.build.json",
+    "db:migrate": "node scripts/migrate.mjs",
     "lint": "oxlint src",
     "typecheck": "tsc --noEmit -p tsconfig.json",
-    "test": "vitest run",
+    "test": "vitest run --no-file-parallelism",
     "start": "node dist/main.js"
   },
   "dependencies": {
     "@nestjs/common": "^12.1.0",
     "@nestjs/core": "^12.1.0",
     "@nestjs/platform-express": "^12.1.0",
+    "pg": "^8.23.0",
     "reflect-metadata": "^0.2.2",
     "rxjs": "^7.8.2"
   },
   "devDependencies": {
     "@nestjs/testing": "^12.1.0",
     "@types/node": "^24.0.0",
+    "@types/pg": "^8.23.1",
     "oxlint": "^1.0.0",
     "typescript": "^7.0.0",
     "vitest": "^5.0.0"
