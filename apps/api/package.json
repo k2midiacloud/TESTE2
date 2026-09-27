@@ -4,6 +4,7 @@
   "private": true,
   "scripts": {
     "build": "tsc -p tsconfig.build.json",
+    "db:migrate": "node scripts/migrate.mjs",
     "lint": "oxlint src",
     "typecheck": "tsc --noEmit -p tsconfig.json",
     "test": "vitest run",
