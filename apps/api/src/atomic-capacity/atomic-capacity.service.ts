@@ -48,28 +48,14 @@ export class AtomicCapacityService {
   async acquire(command: AcquireCommand): Promise<OperationResult> {
     this.validateCommand(command);
 
-    const now = this.clock.now();
     const payload = this.payloadFor(command);
 
-    return this.database.transaction(async (client) => {
-      const initialResult = await client.query<OperationSnapshotRow>(
-        `
-          SELECT
-            operation_id,
-            resource_id,
-            wallet_id,
-            amount,
-            state,
-            reason,
-            hold_expires_at,
-            payload = $2::jsonb AS payload_matches
-          FROM issue3_lab.operations
-          WHERE operation_id = $1
-        `,
-        [command.operationId, payload],
+    return this.database.transactionWithDeadlockRetry(async (client) => {
+      const initial = await this.getOperationSnapshot(
+        client,
+        command.operationId,
+        payload,
       );
-
-      const initial = initialResult.rows[0];
 
       if (initial && !initial.payload_matches) {
         throw new IdempotencyConflictError(command.operationId);
@@ -79,25 +65,9 @@ export class AtomicCapacityService {
         return this.toResult(initial);
       }
 
-      const resourceId = initial?.resource_id ?? command.resourceId;
-
-      const resourceResult = await client.query<CapacityRow>(
-        `
-          SELECT capacity
-          FROM issue3_lab.capacity_resources
-          WHERE resource_id = $1
-          FOR UPDATE
-        `,
-        [resourceId],
-      );
-
-      const resource = resourceResult.rows[0];
-
-      if (!resource) {
-        throw new DataInvariantError(`resource ${resourceId} does not exist`);
-      }
-
       if (!initial) {
+        const insertNow = this.clock.now();
+
         await client.query(
           `
             INSERT INTO issue3_lab.operations (
@@ -124,60 +94,95 @@ export class AtomicCapacityService {
             String(command.amount),
             payload,
             command.holdExpiresAt,
-            now,
+            insertNow,
           ],
         );
       }
 
-      const lockedResult = await client.query<OperationSnapshotRow>(
-        `
-          SELECT
-            operation_id,
-            resource_id,
-            wallet_id,
-            amount,
-            state,
-            reason,
-            hold_expires_at,
-            payload = $2::jsonb AS payload_matches
-          FROM issue3_lab.operations
-          WHERE operation_id = $1
-          FOR UPDATE
-        `,
-        [command.operationId, payload],
+      const persisted = await this.getOperationSnapshot(
+        client,
+        command.operationId,
+        payload,
       );
 
-      const locked = lockedResult.rows[0];
-
-      if (!locked) {
+      if (!persisted) {
         throw new DataInvariantError('operation disappeared after idempotent insert');
       }
 
-      if (!locked.payload_matches) {
+      if (!persisted.payload_matches) {
         throw new IdempotencyConflictError(command.operationId);
       }
 
-      if (this.isTerminal(locked.state)) {
-        return this.toResult(locked);
+      if (this.isTerminal(persisted.state)) {
+        return this.toResult(persisted);
       }
 
-      await this.expireResourceHolds(client, locked.resource_id, now);
+      await this.lockWallet(client, persisted.wallet_id);
+      const resource = await this.lockResource(client, persisted.resource_id);
 
-      const current = await this.lockOperation(client, command.operationId);
+      const lockedRows = await this.lockWalletOperations(
+        client,
+        persisted.wallet_id,
+        command.operationId,
+        payload,
+      );
 
-      if (this.isTerminal(current.state) || current.state === 'PROCESSING') {
+      const current = lockedRows.find(
+        (operation) => operation.operation_id === command.operationId,
+      );
+
+      if (!current) {
+        throw new OperationNotFoundError(command.operationId);
+      }
+
+      if (!current.payload_matches) {
+        throw new IdempotencyConflictError(command.operationId);
+      }
+
+      const decisionNow = this.clock.now();
+
+      if (this.isTerminal(current.state)) {
         return this.toResult(current);
       }
 
-      if (current.hold_expires_at.getTime() <= now.getTime()) {
+      if (current.state === 'PROCESSING') {
+        if (this.isExpired(current, decisionNow)) {
+          const expired = await this.expireProcessingOperation(
+            client,
+            current,
+            decisionNow,
+          );
+          return this.toResult(expired);
+        }
+
+        return this.toResult(current);
+      }
+
+      if (current.state !== 'PENDING') {
+        throw new DataInvariantError(
+          `operation ${current.operation_id} cannot acquire from state ${current.state}`,
+        );
+      }
+
+      if (this.isExpired(current, decisionNow)) {
         const expired = await this.updateOperation(
           client,
           current.operation_id,
           'EXPIRED',
           'HOLD_EXPIRED',
-          now,
+          decisionNow,
         );
         return this.toResult(expired);
+      }
+
+      for (const operation of lockedRows) {
+        if (
+          operation.operation_id !== current.operation_id &&
+          operation.state === 'PROCESSING' &&
+          this.isExpired(operation, decisionNow)
+        ) {
+          await this.expireProcessingOperation(client, operation, decisionNow);
+        }
       }
 
       const usageResult = await client.query<CapacityUsageRow>(
@@ -185,9 +190,12 @@ export class AtomicCapacityService {
           SELECT COUNT(*)::int AS used
           FROM issue3_lab.operations
           WHERE resource_id = $1
-            AND state IN ('PROCESSING', 'CONFIRMED')
+            AND (
+              state = 'CONFIRMED'
+              OR (state = 'PROCESSING' AND hold_expires_at > $2)
+            )
         `,
-        [current.resource_id],
+        [current.resource_id, decisionNow],
       );
 
       const used = usageResult.rows[0]?.used ?? 0;
@@ -198,7 +206,7 @@ export class AtomicCapacityService {
           current.operation_id,
           'REJECTED',
           'CAPACITY_UNAVAILABLE',
-          now,
+          decisionNow,
         );
         return this.toResult(rejected);
       }
@@ -221,7 +229,7 @@ export class AtomicCapacityService {
           current.operation_id,
           'REJECTED',
           'INSUFFICIENT_FUNDS',
-          now,
+          decisionNow,
         );
         return this.toResult(rejected);
       }
@@ -237,7 +245,7 @@ export class AtomicCapacityService {
           )
           VALUES ($1, $2, 'RESERVED', $3::bigint, $4)
         `,
-        [current.operation_id, current.wallet_id, current.amount, now],
+        [current.operation_id, current.wallet_id, current.amount, decisionNow],
       );
 
       const processing = await this.updateOperation(
@@ -245,7 +253,7 @@ export class AtomicCapacityService {
         current.operation_id,
         'PROCESSING',
         null,
-        now,
+        decisionNow,
       );
 
       return this.toResult(processing);
@@ -257,26 +265,8 @@ export class AtomicCapacityService {
       throw new TypeError('operationId is required');
     }
 
-    const now = this.clock.now();
-
-    return this.database.transaction(async (client) => {
-      const snapshotResult = await client.query<OperationRow>(
-        `
-          SELECT
-            operation_id,
-            resource_id,
-            wallet_id,
-            amount,
-            state,
-            reason,
-            hold_expires_at
-          FROM issue3_lab.operations
-          WHERE operation_id = $1
-        `,
-        [operationId],
-      );
-
-      const snapshot = snapshotResult.rows[0];
+    return this.database.transactionWithDeadlockRetry(async (client) => {
+      const snapshot = await this.getOperation(client, operationId);
 
       if (!snapshot) {
         throw new OperationNotFoundError(operationId);
@@ -286,19 +276,11 @@ export class AtomicCapacityService {
         return this.toResult(snapshot);
       }
 
-      await client.query(
-        `
-          SELECT resource_id
-          FROM issue3_lab.capacity_resources
-          WHERE resource_id = $1
-          FOR UPDATE
-        `,
-        [snapshot.resource_id],
-      );
-
-      await this.expireResourceHolds(client, snapshot.resource_id, now);
+      await this.lockWallet(client, snapshot.wallet_id);
+      await this.lockResource(client, snapshot.resource_id);
 
       const current = await this.lockOperation(client, operationId);
+      const decisionNow = this.clock.now();
 
       if (this.isTerminal(current.state)) {
         return this.toResult(current);
@@ -308,6 +290,15 @@ export class AtomicCapacityService {
         throw new DataInvariantError(
           `operation ${operationId} cannot confirm from state ${current.state}`,
         );
+      }
+
+      if (this.isExpired(current, decisionNow)) {
+        const expired = await this.expireProcessingOperation(
+          client,
+          current,
+          decisionNow,
+        );
+        return this.toResult(expired);
       }
 
       const consumeResult = await client.query(
@@ -339,7 +330,7 @@ export class AtomicCapacityService {
           )
           VALUES ($1, $2, 'CONSUMED', $3::bigint, $4)
         `,
-        [current.operation_id, current.wallet_id, current.amount, now],
+        [current.operation_id, current.wallet_id, current.amount, decisionNow],
       );
 
       const confirmed = await this.updateOperation(
@@ -347,19 +338,43 @@ export class AtomicCapacityService {
         current.operation_id,
         'CONFIRMED',
         null,
-        now,
+        decisionNow,
       );
 
       return this.toResult(confirmed);
     });
   }
 
-  private async expireResourceHolds(
+  private async getOperationSnapshot(
     client: PoolClient,
-    resourceId: string,
-    now: Date,
-  ): Promise<void> {
-    const expiredResult = await client.query<OperationRow>(
+    operationId: string,
+    payload: string,
+  ): Promise<OperationSnapshotRow | undefined> {
+    const result = await client.query<OperationSnapshotRow>(
+      `
+        SELECT
+          operation_id,
+          resource_id,
+          wallet_id,
+          amount,
+          state,
+          reason,
+          hold_expires_at,
+          payload = $2::jsonb AS payload_matches
+        FROM issue3_lab.operations
+        WHERE operation_id = $1
+      `,
+      [operationId, payload],
+    );
+
+    return result.rows[0];
+  }
+
+  private async getOperation(
+    client: PoolClient,
+    operationId: string,
+  ): Promise<OperationRow | undefined> {
+    const result = await client.query<OperationRow>(
       `
         SELECT
           operation_id,
@@ -370,56 +385,80 @@ export class AtomicCapacityService {
           reason,
           hold_expires_at
         FROM issue3_lab.operations
+        WHERE operation_id = $1
+      `,
+      [operationId],
+    );
+
+    return result.rows[0];
+  }
+
+  private async lockWallet(client: PoolClient, walletId: string): Promise<void> {
+    const result = await client.query(
+      `
+        SELECT wallet_id
+        FROM issue3_lab.synthetic_wallets
+        WHERE wallet_id = $1
+        FOR UPDATE
+      `,
+      [walletId],
+    );
+
+    if ((result.rowCount ?? 0) !== 1) {
+      throw new DataInvariantError(`wallet ${walletId} does not exist`);
+    }
+  }
+
+  private async lockResource(
+    client: PoolClient,
+    resourceId: string,
+  ): Promise<CapacityRow> {
+    const result = await client.query<CapacityRow>(
+      `
+        SELECT capacity
+        FROM issue3_lab.capacity_resources
         WHERE resource_id = $1
-          AND state = 'PROCESSING'
-          AND hold_expires_at <= $2
+        FOR UPDATE
+      `,
+      [resourceId],
+    );
+
+    const resource = result.rows[0];
+
+    if (!resource) {
+      throw new DataInvariantError(`resource ${resourceId} does not exist`);
+    }
+
+    return resource;
+  }
+
+  private async lockWalletOperations(
+    client: PoolClient,
+    walletId: string,
+    operationId: string,
+    payload: string,
+  ): Promise<OperationSnapshotRow[]> {
+    const result = await client.query<OperationSnapshotRow>(
+      `
+        SELECT
+          operation_id,
+          resource_id,
+          wallet_id,
+          amount,
+          state,
+          reason,
+          hold_expires_at,
+          payload = $3::jsonb AS payload_matches
+        FROM issue3_lab.operations
+        WHERE wallet_id = $1
+          AND (operation_id = $2 OR state = 'PROCESSING')
         ORDER BY operation_id
         FOR UPDATE
       `,
-      [resourceId, now],
+      [walletId, operationId, payload],
     );
 
-    for (const expired of expiredResult.rows) {
-      const releaseResult = await client.query(
-        `
-          UPDATE issue3_lab.synthetic_wallets
-          SET
-            reserved_amount = reserved_amount - $2::bigint,
-            available_amount = available_amount + $2::bigint
-          WHERE wallet_id = $1
-            AND reserved_amount >= $2::bigint
-        `,
-        [expired.wallet_id, expired.amount],
-      );
-
-      if ((releaseResult.rowCount ?? 0) !== 1) {
-        throw new DataInvariantError(
-          `wallet ${expired.wallet_id} cannot release expired reservation`,
-        );
-      }
-
-      await client.query(
-        `
-          INSERT INTO issue3_lab.synthetic_ledger (
-            operation_id,
-            wallet_id,
-            event_type,
-            amount,
-            created_at
-          )
-          VALUES ($1, $2, 'RELEASED', $3::bigint, $4)
-        `,
-        [expired.operation_id, expired.wallet_id, expired.amount, now],
-      );
-
-      await this.updateOperation(
-        client,
-        expired.operation_id,
-        'EXPIRED',
-        'HOLD_EXPIRED',
-        now,
-      );
-    }
+    return result.rows;
   }
 
   private async lockOperation(
@@ -450,6 +489,59 @@ export class AtomicCapacityService {
     }
 
     return operation;
+  }
+
+  private async expireProcessingOperation(
+    client: PoolClient,
+    operation: OperationRow,
+    now: Date,
+  ): Promise<OperationRow> {
+    if (operation.state !== 'PROCESSING') {
+      throw new DataInvariantError(
+        `operation ${operation.operation_id} cannot expire reserved balance from state ${operation.state}`,
+      );
+    }
+
+    const releaseResult = await client.query(
+      `
+        UPDATE issue3_lab.synthetic_wallets
+        SET
+          reserved_amount = reserved_amount - $2::bigint,
+          available_amount = available_amount + $2::bigint
+        WHERE wallet_id = $1
+          AND reserved_amount >= $2::bigint
+      `,
+      [operation.wallet_id, operation.amount],
+    );
+
+    if ((releaseResult.rowCount ?? 0) !== 1) {
+      throw new DataInvariantError(
+        `wallet ${operation.wallet_id} cannot release expired reservation`,
+      );
+    }
+
+    await client.query(
+      `
+        INSERT INTO issue3_lab.synthetic_ledger (
+          operation_id,
+          wallet_id,
+          event_type,
+          amount,
+          created_at
+        )
+        VALUES ($1, $2, 'RELEASED', $3::bigint, $4)
+        ON CONFLICT (operation_id, event_type) DO NOTHING
+      `,
+      [operation.operation_id, operation.wallet_id, operation.amount, now],
+    );
+
+    return this.updateOperation(
+      client,
+      operation.operation_id,
+      'EXPIRED',
+      'HOLD_EXPIRED',
+      now,
+    );
   }
 
   private async updateOperation(
@@ -483,6 +575,10 @@ export class AtomicCapacityService {
     }
 
     return operation;
+  }
+
+  private isExpired(operation: OperationRow, now: Date): boolean {
+    return operation.hold_expires_at.getTime() <= now.getTime();
   }
 
   private isTerminal(state: OperationState): boolean {
