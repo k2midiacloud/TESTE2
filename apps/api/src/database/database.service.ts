@@ -2,6 +2,8 @@ import { Injectable, OnModuleDestroy } from '@nestjs/common';
 import { Pool } from 'pg';
 import type { PoolClient } from 'pg';
 
+const DEFAULT_DEADLOCK_RETRIES = 2;
+
 @Injectable()
 export class DatabaseService implements OnModuleDestroy {
   private pool: Pool | null = null;
@@ -41,6 +43,25 @@ export class DatabaseService implements OnModuleDestroy {
     }
   }
 
+  async transactionWithDeadlockRetry<T>(
+    work: (client: PoolClient) => Promise<T>,
+    maxDeadlockRetries = DEFAULT_DEADLOCK_RETRIES,
+  ): Promise<T> {
+    let retries = 0;
+
+    while (true) {
+      try {
+        return await this.transaction(work);
+      } catch (error) {
+        if (!this.isDeadlock(error) || retries >= maxDeadlockRetries) {
+          throw error;
+        }
+
+        retries += 1;
+      }
+    }
+  }
+
   async onModuleDestroy(): Promise<void> {
     if (!this.pool) {
       return;
@@ -49,5 +70,14 @@ export class DatabaseService implements OnModuleDestroy {
     const pool = this.pool;
     this.pool = null;
     await pool.end();
+  }
+
+  private isDeadlock(error: unknown): boolean {
+    return (
+      typeof error === 'object' &&
+      error !== null &&
+      'code' in error &&
+      (error as { code?: unknown }).code === '40P01'
+    );
   }
 }
